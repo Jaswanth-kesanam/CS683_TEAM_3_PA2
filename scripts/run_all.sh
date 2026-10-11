@@ -13,12 +13,12 @@ BIN=$(ls bin/*-"$TAG" 2>/dev/null | head -1)
 [ -x "$BIN" ] || { echo "no binary bin/*-$TAG (build it with ./build_champsim.sh ... $TAG)"; exit 1; }
 OUT=results/$TAG; mkdir -p "$OUT"
 echo "binary: $BIN | traces: $TRACE_DIR | warmup=$WARMUP sim=$SIM | jobs=$JOBS"
-ls "$TRACE_DIR"/*.xz | while read -r t; do
-  name=$(basename "$t" .champsimtrace.xz)
+ls "$TRACE_DIR"/*.champsimtrace.xz "$TRACE_DIR"/*.champsimtrace.gz 2>/dev/null | while read -r t; do
+  name=$(basename "$t"); name=${name%.champsimtrace.*}
   [ -s "$OUT/$name.txt" ] && grep -q "Region of Interest" "$OUT/$name.txt" && continue
   echo "$t"
 done | xargs -P "$JOBS" -I{} bash -c '
-  t={}; name=$(basename "$t" .champsimtrace.xz)
+  t={}; name=$(basename "$t"); name=${name%.champsimtrace.*}
   echo "[start] $name"
   "'"$BIN"'" -warmup_instructions '"$WARMUP"' -simulation_instructions '"$SIM"' -traces "$t" > "'"$OUT"'/$name.txt" 2>&1 \
     && echo "[done]  $name" || echo "[FAIL]  $name (see '"$OUT"'/$name.txt)"'
