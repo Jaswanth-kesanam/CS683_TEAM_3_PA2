@@ -21,19 +21,26 @@ def get(t, c, k):
     v = val.get((t, c), {}).get(k)
     return float(v) if v not in (None, "", "None") else 0.0
 
-def bars(configs, key, ylabel, title, fname, hline=None):
+def bars(configs, key, ylabel, title, fname, hline=None, zoom=False, fmt="{:.2f}"):
     n = len(configs); w = 0.8 / n
     fig, ax = plt.subplots(figsize=(max(6, 1.1 * len(traces) + 2), 4.2))
+    allv = []
     for i, c in enumerate(configs):
         xs = [j + (i - (n - 1) / 2) * w for j in range(len(traces))]
-        ax.bar(xs, [get(t, c, key) for t in traces], w, label=c, color=COLORS[i % len(COLORS)], edgecolor="#555")
+        vs = [get(t, c, key) for t in traces]; allv += vs
+        b = ax.bar(xs, vs, w, label=c, color=COLORS[i % len(COLORS)], edgecolor="#555")
+        ax.bar_label(b, labels=[fmt.format(v) for v in vs], fontsize=7, padding=2)
+    if zoom:   # small differences: zoom the y-axis around the data (like the PDF's example)
+        lo, hi = min(allv + [hline or 1.0]), max(allv + [hline or 1.0])
+        pad = max(0.002, (hi - lo) * 0.4)
+        ax.set_ylim(lo - pad, hi + pad)
     if hline is not None:
         ax.axhline(hline, color="#C44E52", ls="--", lw=1, label=base)
     ax.set_xticks(range(len(traces))); ax.set_xticklabels(traces, rotation=30, ha="right", fontsize=8)
     ax.set_ylabel(ylabel); ax.set_title(title); ax.legend(fontsize=8); ax.grid(axis="y", alpha=0.3)
     fig.tight_layout(); fig.savefig(os.path.join(ROOT, "plots", fname), dpi=150); plt.close(fig)
 
-bars(pfs, "speedup", "Speedup", "Speedup of L1D prefetchers over baseline (no prefetching)", "speedup.png", hline=1.0)
+bars(pfs, "speedup", "Speedup", "Speedup of L1D prefetchers over baseline (no prefetching)", "speedup.png", hline=1.0, zoom=True, fmt="{:.3f}")
 bars([base] + pfs, "l1d_load_mpki", "L1D load MPKI", "L1D load MPKI", "l1d_mpki.png")
 bars(pfs, "accuracy_pct", "L1D prefetch accuracy (%)", "L1D prefetch accuracy", "accuracy.png")
 bars(pfs, "coverage_pct", "L1D prefetch coverage (%)", "L1D prefetch coverage", "coverage.png")
