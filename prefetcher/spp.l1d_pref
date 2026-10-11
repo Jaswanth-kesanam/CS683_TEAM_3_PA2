@@ -1,24 +1,338 @@
+//=============================================================================
+//  Stride Pattern Prefetcher (SPP) for the L1D  --  CS683 PA2, Task 1B
+//=============================================================================
+//
+//  WHAT IT DOES
+//  ------------
+//  For every load instruction (IP) it watches the stride between consecutive
+//  cache lines that IP touches, and handles two kinds of behaviour:
+//
+//   1. Uniform stride      A, A+2, A+4, A+6 ...           (same stride repeats)
+//   2. Non-uniform stride  A, A+1, A+3, A+5, A+7, A+10 ... (a stride SEQUENCE
+//                          such as +1,+2,+2,+2,+3 that repeats)
+//
+//  Uniform strides get priority. When an IP's strides stop repeating, the
+//  prefetcher falls back to the non-uniform predictor for that IP.
+//
+//  STRUCTURES  (sizes are the exact bit widths used below)
+//  ----------
+//  * IP table (IPT): 32 entries, fully associative, LRU. One entry per load IP.
+//      valid          1 bit
+//      ip_tag        10 bits   hashed IP (IP-stride kept only 8 raw IP bits)
+//      last_line     12 bits   low 12 bits of the last cache-line address
+//      last_stride    7 bits   signed, -64..+63 lines (a 4 KB page = 64 lines)
+//      conf           2 bits   uniform-stride confidence counter, 0..3
+//      signature     12 bits   compressed history of this IP's recent strides
+//      lru            5 bits   LRU position 0..31
+//                    -------
+//                    49 bits per entry  x 32 entries = 1568 bits = 196 bytes
+//
+//  * Pattern table (PT): 256 entries, direct mapped, shared by all IPs.
+//    Maps "signature of recent strides" -> "the stride that came next".
+//      next_stride    7 bits   signed
+//      conf           2 bits   0..3
+//                    -------
+//                     9 bits per entry  x 256 entries = 2304 bits = 288 bytes
+//
+//  * Throttling state: degree (3 bits) + a 9-bit "issued in this window" and a
+//    9-bit "useful in this window" counter (window = 256 prefetches) = 21 bits.
+//    (In the simulator these two window counts are taken as differences of
+//    ChampSim's pf_lower_level / pf_useful counters, which is equivalent.)
+//
+//  TOTAL: 1568 + 2304 + 21 = 3893 bits  ~= 487 bytes
+//
+//  SIGNATURE
+//  ---------
+//    signature = ((signature << 3) XOR stride) & 0xFFF
+//  Shifting by 3 bits and keeping 12 bits means the signature summarises
+//  roughly the last 4 strides. For +1,+2,+2,+2,+3 at least 3 past strides are
+//  needed: after (+2,+2) the next stride can be +2 OR +3, but every window of
+//  3 strides has exactly one successor.
+//
+//  ACCURACY-BASED THROTTLING
+//  -------------------------
+//  Every ACC_WINDOW prefetches, accuracy = useful / issued over that window,
+//  using ChampSim's own L1D counters (pf_useful, pf_lower_level -- the same
+//  numbers ChampSim prints as "ACCURACY"). The degree is then set from the
+//  accuracy band (see ACC_HIGH / ACC_MID / ACC_LOW below). The degree never
+//  drops to 0: with no prefetches there would be nothing left to measure, so
+//  the prefetcher could never recover.
+//=============================================================================
+
 #include "cache.h"
 
+// ---------------------------------------------------------------- parameters
+#define IPT_ENTRIES     32      // IP table entries
+#define IP_TAG_BITS     10
+#define LINE_BITS       12      // bits of the cache-line address kept per IP
+#define STRIDE_BITS      7      // signed stride field (-64..+63)
+#define MAX_STRIDE      63      // a 4 KB page holds 64 lines
+#define CONF_MAX         3      // 2-bit saturating counters
+#define UNI_THRESH       2      // uniform mode when IPT conf >= this
+#define PT_THRESH        2      // trust a pattern-table entry when conf >= this
 
-void CACHE::l1d_prefetcher_initialize() 
+#define SIG_BITS        12
+#define SIG_SHIFT        3
+#define SIG_MASK        ((1 << SIG_BITS) - 1)
+#define PT_ENTRIES     256
+
+// throttling (all can be overridden at compile time for the sensitivity sweep)
+#ifndef ACC_WINDOW
+#define ACC_WINDOW     256      // re-evaluate accuracy every 256 issued prefetches
+#endif
+#ifndef ACC_HIGH
+#define ACC_HIGH        75      // accuracy >= 75%        -> DEG_HIGH
+#endif
+#ifndef ACC_MID
+#define ACC_MID         50      // 50% <= accuracy < 75%  -> DEG_MID
+#endif
+#ifndef ACC_LOW
+#define ACC_LOW         25      // 25% <= accuracy < 50%  -> DEG_LOW, below -> DEG_MIN
+#endif
+#ifndef DEG_HIGH
+#define DEG_HIGH         4
+#endif
+#ifndef DEG_MID
+#define DEG_MID          3
+#endif
+#ifndef DEG_LOW
+#define DEG_LOW          2
+#endif
+#ifndef DEG_MIN
+#define DEG_MIN          1
+#endif
+#ifndef START_DEGREE
+#define START_DEGREE     2
+#endif
+
+// ---------------------------------------------------------------- structures
+struct IPT_ENTRY {
+    bool     valid;
+    uint32_t ip_tag;       // IP_TAG_BITS
+    uint32_t last_line;    // LINE_BITS
+    int32_t  last_stride;  // STRIDE_BITS, signed
+    uint32_t conf;         // 2 bits
+    uint32_t signature;    // SIG_BITS
+    uint32_t lru;          // log2(IPT_ENTRIES) bits
+};
+
+struct PT_ENTRY {
+    int32_t  next_stride;  // STRIDE_BITS, signed
+    uint32_t conf;         // 2 bits
+};
+
+static IPT_ENTRY ipt[IPT_ENTRIES];
+static PT_ENTRY  pt[PT_ENTRIES];
+
+// throttling state
+static uint32_t spp_degree = START_DEGREE;
+static uint64_t snap_useful = 0, snap_issued = 0;
+
+// statistics printed at the end (not part of the hardware budget)
+static uint64_t st_uniform_pf = 0, st_pattern_pf = 0, st_page_stop = 0;
+static uint64_t st_degree_epochs[DEG_HIGH + 1] = {0};
+
+// ---------------------------------------------------------------- helpers
+// Fold the full IP into IP_TAG_BITS bits so different loads rarely collide.
+static inline uint32_t ip_hash(uint64_t ip)
+{
+    return (uint32_t)((ip ^ (ip >> IP_TAG_BITS) ^ (ip >> (2 * IP_TAG_BITS))) & ((1 << IP_TAG_BITS) - 1));
+}
+
+// Append a stride to a signature.
+static inline uint32_t sig_update(uint32_t sig, int32_t stride)
+{
+    uint32_t s = (uint32_t)stride & ((1 << STRIDE_BITS) - 1);   // 7-bit two's complement
+    return ((sig << SIG_SHIFT) ^ s) & SIG_MASK;
+}
+
+// 12-bit signature -> 8-bit pattern-table index.
+static inline uint32_t pt_index(uint32_t sig)
+{
+    return (sig ^ (sig >> 8)) & (PT_ENTRIES - 1);
+}
+
+// Learn "after signature `sig`, the next stride was `stride`".
+static inline void pt_train(uint32_t sig, int32_t stride)
+{
+    PT_ENTRY &e = pt[pt_index(sig)];
+    if (e.next_stride == stride) {
+        if (e.conf < CONF_MAX) e.conf++;
+    } else if (e.conf > 0) {
+        e.conf--;                       // a different stride: lose confidence first
+    } else {
+        e.next_stride = stride;         // confidence gone: replace the prediction
+        e.conf = 1;
+    }
+}
+
+// Move entry `idx` to the most-recently-used position.
+static inline void lru_touch(uint32_t idx)
+{
+    for (uint32_t i = 0; i < IPT_ENTRIES; i++)
+        if (ipt[i].lru < ipt[idx].lru) ipt[i].lru++;
+    ipt[idx].lru = 0;
+}
+
+// Accuracy-based throttling: called on every training access.
+static void update_degree(uint64_t useful_now, uint64_t issued_now)
+{
+    // ChampSim resets its counters when the measured region starts; resync.
+    if (issued_now < snap_issued || useful_now < snap_useful) {
+        snap_issued = issued_now;
+        snap_useful = useful_now;
+        return;
+    }
+    uint64_t issued = issued_now - snap_issued;
+    if (issued < ACC_WINDOW) return;
+
+    uint64_t useful = useful_now - snap_useful;
+    uint32_t acc = (uint32_t)(useful * 100 / issued);
+
+    if      (acc >= ACC_HIGH) spp_degree = DEG_HIGH;
+    else if (acc >= ACC_MID)  spp_degree = DEG_MID;
+    else if (acc >= ACC_LOW)  spp_degree = DEG_LOW;
+    else                      spp_degree = DEG_MIN;
+
+    st_degree_epochs[spp_degree]++;
+    snap_issued = issued_now;
+    snap_useful = useful_now;
+}
+
+// ---------------------------------------------------------------- ChampSim hooks
+void CACHE::l1d_prefetcher_initialize()
 {
     std::cout << "------------------------------------------------" << std::endl;
     std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
+    std::cout << "  IPT " << IPT_ENTRIES << " entries, PT " << PT_ENTRIES << " entries, degree "
+              << DEG_MIN << ".." << DEG_HIGH << " (start " << START_DEGREE << ")" << std::endl;
+    std::cout << "  accuracy bands: >=" << ACC_HIGH << "% ->" << DEG_HIGH << ", >=" << ACC_MID << "% ->" << DEG_MID
+              << ", >=" << ACC_LOW << "% ->" << DEG_LOW << ", else " << DEG_MIN << "; window " << ACC_WINDOW << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
+
+    for (uint32_t i = 0; i < IPT_ENTRIES; i++) {
+        ipt[i].valid = false;
+        ipt[i].ip_tag = ipt[i].last_line = ipt[i].conf = ipt[i].signature = 0;
+        ipt[i].last_stride = 0;
+        ipt[i].lru = i;
+    }
+    for (uint32_t i = 0; i < PT_ENTRIES; i++) {
+        pt[i].next_stride = 0;
+        pt[i].conf = 0;
+    }
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+    // Train only on demand loads. ChampSim also calls this hook for prefetch
+    // requests (type == PREFETCH); learning from our own prefetches would
+    // pollute the stride history.
+    if (type != LOAD)
+        return;
+
+    update_degree(pf_useful, pf_lower_level);
+
+    uint64_t line     = addr >> LOG2_BLOCK_SIZE;                   // full cache-line address
+    uint32_t line_low = (uint32_t)(line & ((1 << LINE_BITS) - 1)); // what the table stores
+    uint32_t tag      = ip_hash(ip);
+
+    // ---- 1. find this IP's entry (allocate on a miss) -----------------------
+    int idx = -1;
+    for (uint32_t i = 0; i < IPT_ENTRIES; i++)
+        if (ipt[i].valid && ipt[i].ip_tag == tag) { idx = i; break; }
+
+    if (idx < 0) {
+        for (uint32_t i = 0; i < IPT_ENTRIES; i++)
+            if (ipt[i].lru == IPT_ENTRIES - 1) { idx = i; break; }   // LRU victim
+        ipt[idx].valid       = true;
+        ipt[idx].ip_tag      = tag;
+        ipt[idx].last_line   = line_low;
+        ipt[idx].last_stride = 0;
+        ipt[idx].conf        = 0;
+        ipt[idx].signature   = 0;
+        lru_touch(idx);
+        return;                       // need a second access to see a stride
+    }
+    IPT_ENTRY &e = ipt[idx];
+    lru_touch(idx);
+
+    // ---- 2. stride, from the stored LINE_BITS bits (wrap-around aware) ------
+    int32_t stride = (int32_t)((line_low - e.last_line) & ((1 << LINE_BITS) - 1));
+    if (stride >= (1 << (LINE_BITS - 1))) stride -= (1 << LINE_BITS);   // to signed
+
+    if (stride == 0)
+        return;                       // same line again: nothing new to learn
+
+    if (stride > MAX_STRIDE || stride < -MAX_STRIDE) {
+        // A jump bigger than a page: start this IP's history afresh.
+        e.last_line   = line_low;
+        e.last_stride = 0;
+        e.conf        = 0;
+        e.signature   = 0;
+        return;
+    }
+
+    // ---- 3. train ----------------------------------------------------------
+    // uniform-stride confidence
+    if (stride == e.last_stride) { if (e.conf < CONF_MAX) e.conf++; }
+    else                         { if (e.conf > 0) e.conf--; }
+
+    // pattern table: "after this history, the stride was `stride`"
+    pt_train(e.signature, stride);
+    e.signature   = sig_update(e.signature, stride);
+    e.last_stride = stride;
+    e.last_line   = line_low;
+
+    // ---- 4. predict and prefetch --------------------------------------------
+    // What does the pattern table expect next, given the updated history?
+    PT_ENTRY &next = pt[pt_index(e.signature)];
+    bool pattern_disagrees = (next.conf >= PT_THRESH) && (next.next_stride != stride);
+
+    uint32_t fill = (MSHR.occupancy < (MSHR.SIZE >> 1)) ? FILL_L1 : FILL_L2;  // as in IP-stride
+    uint64_t page = addr >> LOG2_PAGE_SIZE;
+
+    if (e.conf >= UNI_THRESH && !pattern_disagrees) {
+        // ---- 4a. UNIFORM: line + stride, line + 2*stride, ...
+        // (If the pattern table confidently predicts a different stride, we are
+        //  in the middle of a repeating sequence such as +2,+2,+2 before a +3,
+        //  so the non-uniform path below is the better choice.)
+        for (uint32_t i = 1; i <= spp_degree; i++) {
+            uint64_t pf_addr = (line + (int64_t)stride * i) << LOG2_BLOCK_SIZE;
+            if ((pf_addr >> LOG2_PAGE_SIZE) != page) { st_page_stop++; break; }  // stay in the page
+            prefetch_line(ip, addr, pf_addr, fill, 0);
+            st_uniform_pf++;
+        }
+    } else {
+        // ---- 4b. NON-UNIFORM: walk the pattern table ahead ("lookahead").
+        // Predict the next stride, pretend it happened, predict the one after, ...
+        uint32_t sig     = e.signature;
+        uint64_t pf_line = line;
+        for (uint32_t i = 0; i < spp_degree; i++) {
+            PT_ENTRY &p = pt[pt_index(sig)];
+            if (p.conf < PT_THRESH) break;                     // not confident: stop
+            pf_line += p.next_stride;
+            uint64_t pf_addr = pf_line << LOG2_BLOCK_SIZE;
+            if ((pf_addr >> LOG2_PAGE_SIZE) != page) { st_page_stop++; break; }  // stay in the page
+            prefetch_line(ip, addr, pf_addr, fill, 0);
+            st_pattern_pf++;
+            sig = sig_update(sig, p.next_stride);
+        }
+    }
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
 {
-	return; //metadata_in;
+    return;
 }
 
 void CACHE::l1d_prefetcher_final_stats()
 {
-
+    std::cout << "SPP final stats" << std::endl;
+    std::cout << "SPP uniform-stride prefetches: " << st_uniform_pf << std::endl;
+    std::cout << "SPP pattern (non-uniform) prefetches: " << st_pattern_pf << std::endl;
+    std::cout << "SPP stopped at page boundary: " << st_page_stop << std::endl;
+    std::cout << "SPP accuracy windows per degree:";
+    for (uint32_t d = DEG_MIN; d <= DEG_HIGH; d++) std::cout << " deg" << d << "=" << st_degree_epochs[d];
+    std::cout << std::endl;
+    std::cout << "SPP final degree: " << spp_degree << std::endl;
 }
