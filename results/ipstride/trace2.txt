@@ -7,7 +7,7 @@ Number of CPUs: 1
 LLC sets: 2048
 LLC ways: 16
 Off-chip DRAM Size: 4096 MB Channels: 1 Width: 64-bit Data Rate: 6400 MT/s
-CPU 0 runs /root/pa2/traces_real/trace2.champsimtrace.gz
+CPU 0 runs traces/trace2.champsimtrace.gz
 .gz
 BTB has LRU replacement policy
 ITLB has LRU replacement policy
@@ -18,15 +18,15 @@ CPU 0 L1D IP-based stride prefetcher
 L1D has LRU replacement policy
 L2C has LRU replacement policy
 LLC has LRU replacement policy
-Heartbeat CPU 0 instructions: 10000000 cycles: 2974295 heartbeat IPC: 3.36214 cumulative IPC: 3.36214 (Simulation time: 0 hr 0 min 24 sec) 
-Heartbeat CPU 0 instructions: 20000001 cycles: 5829329 heartbeat IPC: 3.50259 cumulative IPC: 3.43093 (Simulation time: 0 hr 0 min 49 sec) 
+Heartbeat CPU 0 instructions: 10000000 cycles: 2974295 heartbeat IPC: 3.36214 cumulative IPC: 3.36214 (Simulation time: 0 hr 0 min 36 sec) 
+Heartbeat CPU 0 instructions: 20000001 cycles: 5829329 heartbeat IPC: 3.50259 cumulative IPC: 3.43093 (Simulation time: 0 hr 1 min 12 sec) 
 
-Warmup complete CPU 0 instructions: 25000002 cycles: 7248938 (Simulation time: 0 hr 1 min 1 sec) 
+Warmup complete CPU 0 instructions: 25000002 cycles: 7248938 (Simulation time: 0 hr 1 min 29 sec) 
 
-Heartbeat CPU 0 instructions: 30000000 cycles: 26596265 heartbeat IPC: 0.481535 cumulative IPC: 0.258434 (Simulation time: 0 hr 1 min 17 sec) 
-Heartbeat CPU 0 instructions: 40000002 cycles: 61387328 heartbeat IPC: 0.28743 cumulative IPC: 0.277068 (Simulation time: 0 hr 1 min 50 sec) 
-Heartbeat CPU 0 instructions: 50000000 cycles: 106779729 heartbeat IPC: 0.220301 cumulative IPC: 0.251179 (Simulation time: 0 hr 2 min 25 sec) 
-Finished CPU 0 instructions: 25000001 cycles: 99530792 cumulative IPC: 0.251179 (Simulation time: 0 hr 2 min 25 sec) 
+Heartbeat CPU 0 instructions: 30000000 cycles: 26596265 heartbeat IPC: 0.481535 cumulative IPC: 0.258434 (Simulation time: 0 hr 1 min 54 sec) 
+Heartbeat CPU 0 instructions: 40000002 cycles: 61387328 heartbeat IPC: 0.28743 cumulative IPC: 0.277068 (Simulation time: 0 hr 2 min 42 sec) 
+Heartbeat CPU 0 instructions: 50000000 cycles: 106779729 heartbeat IPC: 0.220301 cumulative IPC: 0.251179 (Simulation time: 0 hr 3 min 32 sec) 
+Finished CPU 0 instructions: 25000001 cycles: 99530792 cumulative IPC: 0.251179 (Simulation time: 0 hr 3 min 32 sec) 
 
 ChampSim completed all CPUs
 

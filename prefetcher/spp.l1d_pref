@@ -3,7 +3,7 @@
 //=============================================================================
 //
 //  WHAT IT DOES
-//  ------------
+// 
 //  For every load instruction (IP) it watches the stride between consecutive
 //  cache lines that IP touches, and handles two kinds of behaviour:
 //
@@ -15,7 +15,7 @@
 //  prefetcher falls back to the non-uniform predictor for that IP.
 //
 //  STRUCTURES  (sizes are the exact bit widths used below)
-//  ----------
+//  
 //  * IP table (IPT): 32 entries, fully associative, LRU. One entry per load IP.
 //      valid          1 bit
 //      ip_tag        10 bits   hashed IP (IP-stride kept only 8 raw IP bits)
@@ -24,14 +24,14 @@
 //      conf           2 bits   uniform-stride confidence counter, 0..3
 //      signature     12 bits   compressed history of this IP's recent strides
 //      lru            5 bits   LRU position 0..31
-//                    -------
+//                    
 //                    49 bits per entry  x 32 entries = 1568 bits = 196 bytes
 //
 //  * Pattern table (PT): 256 entries, direct mapped, shared by all IPs.
 //    Maps "signature of recent strides" -> "the stride that came next".
 //      next_stride    7 bits   signed
 //      conf           2 bits   0..3
-//                    -------
+//                   
 //                     9 bits per entry  x 256 entries = 2304 bits = 288 bytes
 //
 //  * Throttling state: degree (3 bits) + a 9-bit "issued in this window" and a
@@ -42,7 +42,7 @@
 //  TOTAL: 1568 + 2304 + 21 = 3893 bits  ~= 487 bytes
 //
 //  SIGNATURE
-//  ---------
+//  
 //    signature = ((signature << 3) XOR stride) & 0xFFF
 //  Shifting by 3 bits and keeping 12 bits means the signature summarises
 //  roughly the last 4 strides. For +1,+2,+2,+2,+3 at least 3 past strides are
@@ -50,18 +50,16 @@
 //  3 strides has exactly one successor.
 //
 //  ACCURACY-BASED THROTTLING
-//  -------------------------
+// 
 //  Every ACC_WINDOW prefetches, accuracy = useful / issued over that window,
 //  using ChampSim's own L1D counters (pf_useful, pf_lower_level -- the same
 //  numbers ChampSim prints as "ACCURACY"). The degree is then set from the
 //  accuracy band (see ACC_HIGH / ACC_MID / ACC_LOW below). The degree never
 //  drops to 0: with no prefetches there would be nothing left to measure, so
 //  the prefetcher could never recover.
-//=============================================================================
 
 #include "cache.h"
 
-// ---------------------------------------------------------------- parameters
 #define IPT_ENTRIES     32      // IP table entries
 #define IP_TAG_BITS     10
 #define LINE_BITS       12      // bits of the cache-line address kept per IP
@@ -105,7 +103,6 @@
 #define START_DEGREE     2
 #endif
 
-// ---------------------------------------------------------------- structures
 struct IPT_ENTRY {
     bool     valid;
     uint32_t ip_tag;       // IP_TAG_BITS
@@ -132,8 +129,6 @@ static uint64_t snap_useful = 0, snap_issued = 0;
 static uint64_t st_uniform_pf = 0, st_pattern_pf = 0, st_page_stop = 0;
 static uint64_t st_degree_epochs[DEG_HIGH + 1] = {0};
 
-// ---------------------------------------------------------------- helpers
-// Fold the full IP into IP_TAG_BITS bits so different loads rarely collide.
 static inline uint32_t ip_hash(uint64_t ip)
 {
     return (uint32_t)((ip ^ (ip >> IP_TAG_BITS) ^ (ip >> (2 * IP_TAG_BITS))) & ((1 << IP_TAG_BITS) - 1));
@@ -151,8 +146,6 @@ static inline uint32_t pt_index(uint32_t sig)
 {
     return (sig ^ (sig >> 8)) & (PT_ENTRIES - 1);
 }
-
-// Learn "after signature `sig`, the next stride was `stride`".
 static inline void pt_train(uint32_t sig, int32_t stride)
 {
     PT_ENTRY &e = pt[pt_index(sig)];
@@ -166,7 +159,6 @@ static inline void pt_train(uint32_t sig, int32_t stride)
     }
 }
 
-// Move entry `idx` to the most-recently-used position.
 static inline void lru_touch(uint32_t idx)
 {
     for (uint32_t i = 0; i < IPT_ENTRIES; i++)
@@ -199,7 +191,6 @@ static void update_degree(uint64_t useful_now, uint64_t issued_now)
     snap_useful = useful_now;
 }
 
-// ---------------------------------------------------------------- ChampSim hooks
 void CACHE::l1d_prefetcher_initialize()
 {
     std::cout << "------------------------------------------------" << std::endl;
@@ -236,7 +227,6 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     uint32_t line_low = (uint32_t)(line & ((1 << LINE_BITS) - 1)); // what the table stores
     uint32_t tag      = ip_hash(ip);
 
-    // ---- 1. find this IP's entry (allocate on a miss) -----------------------
     int idx = -1;
     for (uint32_t i = 0; i < IPT_ENTRIES; i++)
         if (ipt[i].valid && ipt[i].ip_tag == tag) { idx = i; break; }
@@ -251,17 +241,16 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         ipt[idx].conf        = 0;
         ipt[idx].signature   = 0;
         lru_touch(idx);
-        return;                       // need a second access to see a stride
+        return;                      
     }
     IPT_ENTRY &e = ipt[idx];
     lru_touch(idx);
 
-    // ---- 2. stride, from the stored LINE_BITS bits (wrap-around aware) ------
     int32_t stride = (int32_t)((line_low - e.last_line) & ((1 << LINE_BITS) - 1));
     if (stride >= (1 << (LINE_BITS - 1))) stride -= (1 << LINE_BITS);   // to signed
 
     if (stride == 0)
-        return;                       // same line again: nothing new to learn
+        return;                       
 
     if (stride > MAX_STRIDE || stride < -MAX_STRIDE) {
         // A jump bigger than a page: start this IP's history afresh.
@@ -272,7 +261,6 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         return;
     }
 
-    // ---- 3. train ----------------------------------------------------------
     // uniform-stride confidence
     if (stride == e.last_stride) { if (e.conf < CONF_MAX) e.conf++; }
     else                         { if (e.conf > 0) e.conf--; }
@@ -283,8 +271,6 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     e.last_stride = stride;
     e.last_line   = line_low;
 
-    // ---- 4. predict and prefetch --------------------------------------------
-    // What does the pattern table expect next, given the updated history?
     PT_ENTRY &next = pt[pt_index(e.signature)];
     bool pattern_disagrees = (next.conf >= PT_THRESH) && (next.next_stride != stride);
 
@@ -303,8 +289,6 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
             st_uniform_pf++;
         }
     } else {
-        // ---- 4b. NON-UNIFORM: walk the pattern table ahead ("lookahead").
-        // Predict the next stride, pretend it happened, predict the one after, ...
         uint32_t sig     = e.signature;
         uint64_t pf_line = line;
         for (uint32_t i = 0; i < spp_degree; i++) {
