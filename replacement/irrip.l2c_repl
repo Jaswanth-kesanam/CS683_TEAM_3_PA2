@@ -22,11 +22,13 @@ uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
     while (1)
     {
         for (int i=0; i<L2C_WAY; i++)
-            if (l2_rrpv[set][i] == maxRRPV)
+            if (!current_set[i].instruction && l2_rrpv[set][i] == maxRRPV) // RATIONALE: data evicted as in normal rrip
+                return i; // eviction index
+            else if (l2_rrpv[set][i] == maxRRPV){ // RATIONALE: instru line at maxRRPC
                 return i;
-
+            }
         for (int i=0; i<L2C_WAY; i++)
-            l2_rrpv[set][i]++;
+            l2_rrpv[set][i]++; //RATIONALE: aging evrey line equivalently
     }
 
     // WE SHOULD NOT REACH HERE
@@ -67,14 +69,15 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     // cout << "CPU: " << cpu << "  L2C " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
     // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
     
-    if (hit)
-        // l2_rrpv[set][way] = 0; // rrip policy
+    if (hit){ // promotion
         if(isInstruction == 1){
            l2_rrpv[set][way] = 0 ;
         }else{
             // RATIONALE for data hits, l2_rrpv left unchanged
         }
-    else {
+        // l2_rrpv[set][way] = 0; // rrip policy
+    }
+    else { // insertion
         if(isInstruction == 1){
            l2_rrpv[set][way] = 0; // RATIONALE instruction expected to be used soon, 
         }else {
