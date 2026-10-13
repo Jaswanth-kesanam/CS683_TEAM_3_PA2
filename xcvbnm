@@ -1,0 +1,4 @@
+#!/bin/bash
+
+sudo podman run --rm -v "$PWD":/w:Z -w /w docker.io/library/gcc:7 ./build_champsim.sh spp rrip bas
+eline 
