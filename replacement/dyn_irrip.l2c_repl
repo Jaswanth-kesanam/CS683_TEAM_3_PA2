@@ -1,0 +1,172 @@
+#include "cache.h"
+
+#define maxRRPV 3
+#define NUM_LEADERS   32                        // RATIONALE: 32 of 1024 sets sample the workload, ~3% of the cache
+#define LEADER_STRIDE (L2C_SET / NUM_LEADERS)   // every 32nd set is a leader, spread evenly over the index space
+#define EPOCH_LEN     4096                      // leader-set accesses per decision window
+#define THRESHOLD     0.25
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+// set-dueling state (leader sets only)
+uint64_t instr_acc, instr_miss, total_acc, total_miss;
+bool irrip_mode;                    // policy used by follower sets: true = I-RRIP, false = RRIP
+uint64_t epochs_irrip, epochs_rrip;
+double last_ratio;
+
+static inline bool is_leader(uint32_t set) // new function
+{
+    return (set % LEADER_STRIDE) == 0;
+}
+
+// decide the follower policy from the leader-set counters
+static void update_mode() // new function
+{
+    last_ratio = (double)(instr_acc + instr_miss) / (double)(total_acc + total_miss);
+    irrip_mode = last_ratio > THRESHOLD;
+    if (irrip_mode)
+        epochs_irrip++;
+    else
+        epochs_rrip++;
+
+    // RATIONALE_:Y halve instead of reset, so history decays and the policy tracks phase changes
+    instr_acc >>= 1;
+    instr_miss >>= 1;
+    total_acc >>= 1;
+    total_miss >>= 1;
+}
+
+// initialize replacement state
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize Dynamic I-RRIP state for L2C (leaders: " << NUM_LEADERS << " epoch: " << EPOCH_LEN << " threshold: " << THRESHOLD << ")" << endl;
+
+    for (int i=0; i<L2C_SET; i++) {
+        for (int j=0; j<L2C_WAY; j++) {
+            l2_rrpv[i][j] = maxRRPV;
+        }
+    }
+
+    instr_acc = instr_miss = total_acc = total_miss = 0;
+    irrip_mode = true; // RATIONALE: start with I-RRIP until the first epoch decides
+    epochs_irrip = epochs_rrip = 0;
+    last_ratio = 0;
+}
+
+// find replacement victim
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    bool use_irrip = !is_leader(set) && irrip_mode;
+
+    // look for the maxRRPV line
+    while (1)
+    {
+        if (use_irrip) { 
+            for (int i=0; i<L2C_WAY; i++)
+                if (!current_set[i].instruction && l2_rrpv[set][i] == maxRRPV) // RATIONALE: data evicted as in normal rrip
+                    return i; // eviction index
+                else if (l2_rrpv[set][i] == maxRRPV){ // RATIONALE: instru line at maxRRPC
+                    return i;
+                }
+        } else {
+            for (int i=0; i<L2C_WAY; i++)
+                if (l2_rrpv[set][i] == maxRRPV)
+                    return i;
+        }
+
+        for (int i=0; i<L2C_WAY; i++)
+            l2_rrpv[set][i]++; //RATIONALE: aging evrey line equivalently
+    }
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+// called on every cache hit and cache fill
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    string TYPE_NAME;
+    if (type == LOAD)
+        TYPE_NAME = "LOAD";
+    else if (type == RFO)
+        TYPE_NAME = "RFO";
+    else if (type == PREFETCH)
+        TYPE_NAME = "PF";
+    else if (type == WRITEBACK)
+        TYPE_NAME = "WB";
+    else if (type == LOAD_TRANSLATION)
+	TYPE_NAME = "L_TN";
+    else if (type == PREFETCH_TRANSLATION)
+	TYPE_NAME = "P_TN";
+    else if (type == TRANSLATION_FROM_L1D)
+	TYPE_NAME = "TN_L1D";
+    else
+        assert(0);
+
+    if (hit)
+        TYPE_NAME += "_HIT";
+    else
+        TYPE_NAME += "_MISS";
+
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    // uncomment this line to see the L2C accesses
+    // cout << "CPU: " << cpu << "  L2C " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
+    // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
+
+    if (is_leader(set)) {
+        // RATIONALE: writebacks are not demand traffic and are never instructions, they would skew the ratio towards data
+        if (type != WRITEBACK) {
+            total_acc++;
+            if (!hit)
+                total_miss++;
+            if (isInstruction == 1) {
+                instr_acc++;
+                if (!hit)
+                    instr_miss++;
+            }
+            if (total_acc >= EPOCH_LEN)
+                update_mode();
+        }
+
+        // leader sets always run plain RRIP
+        if (hit)
+            l2_rrpv[set][way] = 0;
+        else
+            l2_rrpv[set][way] = maxRRPV-1;  //insert with RRPV2
+        return;
+    }
+
+    if (!irrip_mode) { // follower in RRIP mode
+        if (hit)
+            l2_rrpv[set][way] = 0;
+        else
+            l2_rrpv[set][way] = maxRRPV-1;  //insert with RRPV2
+        return;
+    }
+
+    // follower in I-RRIP mode
+    if (hit){ // promotion
+        if(isInstruction == 1){
+           l2_rrpv[set][way] = 0 ;
+        }else{
+            // RATIONALE for data hits, l2_rrpv left unchanged
+        }
+    }
+    else { // insertion
+        if(isInstruction == 1){
+           l2_rrpv[set][way] = 0; // RATIONALE instruction expected to be used soon,
+        }else {
+            l2_rrpv[set][way] = maxRRPV-1; // RATIONALE if data, then no change from rrip policy
+        }
+    }
+}
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "Dynamic I-RRIP: epochs in I-RRIP mode: " << epochs_irrip << " epochs in RRIP mode: " << epochs_rrip;
+    cout << " final mode: " << (irrip_mode ? "I-RRIP" : "RRIP") << " last ratio: " << last_ratio << endl;
+}
